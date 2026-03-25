@@ -2,7 +2,7 @@ import asyncio
 import os
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 import asyncpg
 from dotenv import load_dotenv
 
@@ -15,6 +15,7 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 pool = None
+user_states = {}
 
 # ---------------- DB ----------------
 
@@ -57,24 +58,6 @@ async def init_db():
         );
         """)
 
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS expense_participants (
-            expense_id INT,
-            user_id BIGINT
-        );
-        """)
-
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS debts (
-            id SERIAL PRIMARY KEY,
-            trip_id INT,
-            from_user BIGINT,
-            to_user BIGINT,
-            amount FLOAT,
-            status TEXT DEFAULT 'pending'
-        );
-        """)
-
 # ---------------- HELPERS ----------------
 
 async def get_user(user_id):
@@ -94,7 +77,7 @@ async def get_name(user_id):
         user = await conn.fetchrow(
             "SELECT name FROM users WHERE telegram_id=$1", user_id
         )
-        return user["name"] if user else str(user_id)
+        return user["name"] if user and user["name"] else f"User {user_id}"
 
 async def set_active_trip(user_id, trip_id):
     async with pool.acquire() as conn:
@@ -108,12 +91,10 @@ async def set_active_trip(user_id, trip_id):
 def menu():
     return ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Create trip")],
-            [KeyboardButton(text="Join last trip")],
-            [KeyboardButton(text="Add expense")],
-            [KeyboardButton(text="Calculate debts")],
-            [KeyboardButton(text="My debts")],
-            [KeyboardButton(text="Final report")],
+            [KeyboardButton(text="✈️ Create trip")],
+            [KeyboardButton(text="🔗 Join last trip")],
+            [KeyboardButton(text="➕ Add expense")],
+            [KeyboardButton(text="📊 Calculate debts")]
         ],
         resize_keyboard=True
     )
@@ -122,22 +103,34 @@ def menu():
 
 @dp.message(Command("start"))
 async def start(message: types.Message):
-    await create_user(message.from_user.id, message.from_user.full_name)
+    user = await get_user(message.from_user.id)
+
+    if not user:
+        user_states[message.from_user.id] = {"step": "name"}
+        await message.answer("👋 Welcome!\n\nEnter your name:")
+        return
+
     await message.answer("🚀 TripSplit ready", reply_markup=menu())
 
-# ---------------- STATES ----------------
-
-user_states = {}
-
-# ---------------- MAIN ----------------
+# ---------------- MAIN HANDLER ----------------
 
 @dp.message()
 async def handler(message: types.Message):
 
     user_id = message.from_user.id
 
+    # === NAME STEP ===
+    if user_id in user_states and user_states[user_id].get("step") == "name":
+
+        await create_user(user_id, message.text)
+
+        user_states.pop(user_id)
+
+        await message.answer(f"✅ Welcome, {message.text}!", reply_markup=menu())
+        return
+
     # JOIN
-    if message.text == "Join last trip":
+    if message.text == "🔗 Join last trip":
         async with pool.acquire() as conn:
             trip = await conn.fetchrow("SELECT * FROM trips ORDER BY id DESC LIMIT 1")
 
@@ -151,17 +144,17 @@ async def handler(message: types.Message):
             )
 
         await set_active_trip(user_id, trip["id"])
-        await message.answer(f"✅ Joined {trip['title']}")
+        await message.answer(f"✅ Joined trip: {trip['title']}")
         return
 
     # CREATE TRIP
-    if message.text == "Create trip":
+    if message.text == "✈️ Create trip":
         user_states[user_id] = {"step": "title"}
-        await message.answer("🧳 Trip name:")
+        await message.answer("🧳 Enter trip name:")
         return
 
     # ADD EXPENSE
-    if message.text == "Add expense":
+    if message.text == "➕ Add expense":
         user = await get_user(user_id)
 
         if not user or not user["active_trip_id"]:
@@ -169,34 +162,27 @@ async def handler(message: types.Message):
             return
 
         user_states[user_id] = {"step": "amount"}
-        await message.answer("💰 Amount:")
+        await message.answer("💰 Enter amount:")
         return
 
     # CALCULATE
-    if message.text == "Calculate debts":
+    if message.text == "📊 Calculate debts":
         await calculate_and_notify(message)
         return
 
-    # MY DEBTS
-    if message.text == "My debts":
-        await show_my_debts(message)
-        return
+    # === STATES FLOW ===
 
-    # FINAL REPORT
-    if message.text == "Final report":
-        await final_report(message)
-        return
-
-    # STATES FLOW
     if user_id in user_states:
         state = user_states[user_id]
 
+        # TITLE
         if state["step"] == "title":
             state["title"] = message.text
             state["step"] = "currency"
-            await message.answer("💱 Currency:")
+            await message.answer("💱 Enter currency (USD / EUR / etc):")
             return
 
+        # CURRENCY
         if state["step"] == "currency":
             async with pool.acquire() as conn:
                 trip_id = await conn.fetchval(
@@ -212,29 +198,26 @@ async def handler(message: types.Message):
             await set_active_trip(user_id, trip_id)
             user_states.pop(user_id)
 
-            await message.answer("✅ Trip created")
+            await message.answer("✅ Trip created!\n\n📌 Others can press 'Join last trip'")
             return
 
+        # AMOUNT
         if state["step"] == "amount":
             try:
                 state["amount"] = float(message.text)
             except:
-                await message.answer("❗ Enter a number")
+                await message.answer("❗ Enter a valid number")
                 return
 
             state["step"] = "note"
-            await message.answer("📝 Comment:")
+            await message.answer("📝 Enter comment:")
             return
 
+        # NOTE
         if state["step"] == "note":
 
             async with pool.acquire() as conn:
                 user = await get_user(user_id)
-
-                if not user or not user["active_trip_id"]:
-                    await message.answer("❗ Trip not found")
-                    return
-
                 trip_id = user["active_trip_id"]
 
                 await conn.execute(
@@ -312,12 +295,6 @@ async def calculate_and_notify(message):
 
     await message.answer(result or "🎉 Nobody owes anyone")
 
-# ---------------- FINAL REPORT ----------------
-
-async def final_report(message):
-
-    await message.answer("📊 Final report coming soon")
-
 # ---------------- RUN ----------------
 
 async def main():
@@ -325,7 +302,6 @@ async def main():
 
     await init_db()
 
-    # 💥 КРИТИЧЕСКИЙ ФИКС
     await bot.delete_webhook(drop_pending_updates=True)
 
     await dp.start_polling(bot)
